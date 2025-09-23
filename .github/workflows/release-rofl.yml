@@ -22,7 +22,7 @@ jobs:
       # TODO: Move this to dedicated GitHub Action for CLI install.
       - name: Install Oasis CLI
         env:
-          CLI_VERSION: 0.15.5
+          CLI_VERSION: 0.16.0
         run: |
           mkdir -p /tmp/oasis-cli
           cd /tmp/oasis-cli
