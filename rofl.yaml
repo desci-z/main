@@ -54,9 +54,10 @@ deployments:
         provider: oasis1qzc8pldvm8vm3duvdrj63wgvkw34y9ucfcxzetqr
         offer: large
         id: 000000000000001e
-    log.view:
-      - oasis1qpx5xq4kwtuawjdc0wty0d0mz08ha62jrc2c236j
-      - oasis1qqugf308vwexacjfszhmk5lgqv9kwgf9ry5zevhx
+        permissions:
+          log.view:
+            - oasis1qpx5xq4kwtuawjdc0wty0d0mz08ha62jrc2c236j
+            - oasis1qqugf308vwexacjfszhmk5lgqv9kwgf9ry5zevhx
   testnet:
     app_id: rofl1qz8c57nvrru0rdtv7242rzwv269a87zh6c8auqr3
     network: testnet
@@ -88,6 +89,7 @@ deployments:
         provider: oasis1qrfeadn03ljm0kfx8wx0d5zf6kj79pxqvv0dukdm
         offer: test
         id: "0000000000000004"
-    log.view:
-      - oasis1qpx5xq4kwtuawjdc0wty0d0mz08ha62jrc2c236j
-      - oasis1qqugf308vwexacjfszhmk5lgqv9kwgf9ry5zevhx
+        permissions:
+          log.view:
+            - oasis1qpx5xq4kwtuawjdc0wty0d0mz08ha62jrc2c236j
+            - oasis1qqugf308vwexacjfszhmk5lgqv9kwgf9ry5zevhx
