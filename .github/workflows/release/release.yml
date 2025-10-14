@@ -1,0 +1,78 @@
+name: Release Ultimate 3.0
+
+on:
+  push:
+    tags: [ "v*" ]
+
+env:
+  # ----- Android -----
+  ANDROID_KEYSTORE_PWD: ${{ secrets.ANDROID_KEYSTORE_PWD }}
+  ANDROID_KEY_ALIAS:    ${{ secrets.ANDROID_KEY_ALIAS }}
+  ANDROID_KEY_PWD:      ${{ secrets.ANDROID_KEY_PWD }}
+  # ----- iOS (Fastlane Match) -----
+  FASTLANE_PASSWORD:    ${{ secrets.FASTLANE_PASSWORD }}
+  FASTLANE_SESSION:     ${{ secrets.FASTLANE_SESSION }}
+  MATCH_PASSWORD:       ${{ secrets.MATCH_PASSWORD }}
+  # ----- Windows -----
+  WINDOWS_CERT:         ${{ secrets.WINDOWS_PFX_BASE64 }}
+  WINDOWS_CERT_PWD:     ${{ secrets.WINDOWS_CERT_PWD }}
+  # ----- GitHub -----
+  GH_TOKEN:             ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm i -g @bubblewrap/cli
+      - run: |
+          npx bubblewrap init --manifest https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/index.html --appName AGI --packageId app.portela.agi --outputDir android --yes
+          npx bubblewrap build --outputDir android
+      - uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlain: ${{ secrets.GOOGLE_PLAY_SA_JSON }}
+          packageName: app.portela.agi
+          releaseFiles: android/app-release-signed.aab
+          track: production
+
+  ios:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm i -g fastlane
+      - run: fastlane ios build_and_upload_testflight
+        working-directory: ios
+
+  electron:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci
+      # Assinatura Windows
+      - if: runner.os == 'Windows'
+        run: |
+          echo %WINDOWS_CERT% | base64 -d > cert.pfx
+          npm i -g electron-builder
+          npx electron-builder -w --publish always -c.win.certificateFile=cert.pfx -c.win.certificatePassword=%WINDOWS_CERT_PWD%
+      # Assinatura macOS
+      - if: runner.os == 'macOS'
+        run: |
+          npm i -g electron-builder
+          CSC_LINK=${{ secrets.MAC_CERT_BASE64 }} CSC_KEY_PASSWORD=${{ secrets.MAC_CERT_PWD }} \
+          npx electron-builder -m --publish always
+      # Linux (Snap + AppImage + deb)
+      - if: runner.os == 'Linux'
+        run: |
+          sudo snap install snapcraft --classic
+          npm i -g electron-builder
+          npx electron-builder -l --publish always
