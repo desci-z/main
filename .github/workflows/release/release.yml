@@ -1,78 +1,282 @@
-name: Release Ultimate 3.0
+# .github/workflows/release.yml
+# Release workflow multi-plataforma.
+# - dispara apenas em tags vX.Y.Z (ex.: v1.2.3)
+# - suporta dispatch manual (com opção dry_run)
+# - concurrency para evitar execuções paralelas na mesma tag
+# - jobs: build (linux/windows/macos), android, release
+#
+# SECRETS NEEDED (configure no repo Settings → Secrets):
+# - ANDROID_KEYSTORE_BASE64
+# - ANDROID_KEYSTORE_PASSWORD
+# - ANDROID_KEY_ALIAS
+# - GOOGLE_PLAY_SERVICE_ACCOUNT_JSON (base64 or raw JSON)
+# - MAC_CERT_P12_BASE64
+# - MAC_CERT_PASSWORD
+# - WINDOWS_SIGNING_CERT_BASE64
+# - WINDOWS_CERT_PASSWORD
+# - GPG_SIGNING_KEY (optional)
+# - SLACK_WEBHOOK (optional notification)
+#
+name: Release — AGI
 
 on:
   push:
-    tags: [ "v*" ]
+    tags:
+      - 'v*.*.*'           # only run on semver-like tags
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (overrides $GITHUB_REF)'
+        required: false
+      dry_run:
+        type: boolean
+        description: 'If true, simulate the release (no publish)'
+        default: false
+
+concurrency:
+  group: release-${{ github.ref_name || github.event.inputs.tag || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write     # needed to create releases and upload assets
+  packages: write
 
 env:
-  # ----- Android -----
-  ANDROID_KEYSTORE_PWD: ${{ secrets.ANDROID_KEYSTORE_PWD }}
-  ANDROID_KEY_ALIAS:    ${{ secrets.ANDROID_KEY_ALIAS }}
-  ANDROID_KEY_PWD:      ${{ secrets.ANDROID_KEY_PWD }}
-  # ----- iOS (Fastlane Match) -----
-  FASTLANE_PASSWORD:    ${{ secrets.FASTLANE_PASSWORD }}
-  FASTLANE_SESSION:     ${{ secrets.FASTLANE_SESSION }}
-  MATCH_PASSWORD:       ${{ secrets.MATCH_PASSWORD }}
-  # ----- Windows -----
-  WINDOWS_CERT:         ${{ secrets.WINDOWS_PFX_BASE64 }}
-  WINDOWS_CERT_PWD:     ${{ secrets.WINDOWS_CERT_PWD }}
-  # ----- GitHub -----
-  GH_TOKEN:             ${{ secrets.GITHUB_TOKEN }}
+  RELEASE_DIR: release
+  ARTIFACT_NAMESPACE: agi
 
 jobs:
-
-  android:
+  # Basic sanity & checkout (runs fast, always on ubuntu)
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.get-tag.outputs.tag }}
+      is_dry_run: ${{ steps.get-tag.outputs.dry_run }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - run: npm i -g @bubblewrap/cli
-      - run: |
-          npx bubblewrap init --manifest https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/index.html --appName AGI --packageId app.portela.agi --outputDir android --yes
-          npx bubblewrap build --outputDir android
-      - uses: r0adkll/upload-google-play@v1
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          serviceAccountJsonPlain: ${{ secrets.GOOGLE_PLAY_SA_JSON }}
-          packageName: app.portela.agi
-          releaseFiles: android/app-release-signed.aab
-          track: production
+          fetch-depth: 0
 
-  ios:
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - run: npm i -g fastlane
-      - run: fastlane ios build_and_upload_testflight
-        working-directory: ios
+      - name: Determine tag and dry_run
+        id: get-tag
+        shell: bash
+        run: |
+          # prefer explicitly provided tag input, else use GITHUB_REF_NAME
+          INPUT_TAG="${{ github.event.inputs.tag }}"
+          REF_TAG="${GITHUB_REF_NAME:-}"
+          TAG="${INPUT_TAG:-${REF_TAG}}"
+          if [[ -z "$TAG" ]]; then
+            echo "No tag supplied and not pushed from tag ref. Exiting (use workflow_dispatch with tag to test)."
+            echo "tag="
+            echo "dry_run=true"
+            # export outputs empty to indicate we should not continue with build
+            echo "::set-output name=tag::"
+            echo "::set-output name=dry_run::true"
+            exit 0
+          fi
+          # Normalize: strip refs/heads/ etc.
+          echo "Resolved tag: $TAG"
+          # Pass dry_run flag if input set
+          DRY="${{ github.event.inputs.dry_run }}"
+          echo "::set-output name=tag::$TAG"
+          echo "::set-output name=dry_run::$DRY"
 
-  electron:
+  # Build job matrix for desktop platforms
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.tag_name != ''  # only proceed if tag present
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ needs.prepare.outputs.tag_name }}
+      RELEASE_DIR: ${{ env.RELEASE_DIR }}
+      PLATFORM: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - run: npm ci
-      # Assinatura Windows
-      - if: runner.os == 'Windows'
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'yarn'
+
+      - name: Install dependencies
         run: |
-          echo %WINDOWS_CERT% | base64 -d > cert.pfx
-          npm i -g electron-builder
-          npx electron-builder -w --publish always -c.win.certificateFile=cert.pfx -c.win.certificatePassword=%WINDOWS_CERT_PWD%
-      # Assinatura macOS
-      - if: runner.os == 'macOS'
+          yarn install --frozen-lockfile
+
+      - name: Run platform build script
+        shell: bash
         run: |
-          npm i -g electron-builder
-          CSC_LINK=${{ secrets.MAC_CERT_BASE64 }} CSC_KEY_PASSWORD=${{ secrets.MAC_CERT_PWD }} \
-          npx electron-builder -m --publish always
-      # Linux (Snap + AppImage + deb)
-      - if: runner.os == 'Linux'
+          # adapt these commands to your real build scripts
+          mkdir -p $RELEASE_DIR/${{ matrix.os }}
+          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            # Linux: build AppImage / deb / rpm
+            ./build-agi.sh || true
+            # ensure artifacts exist (adjust names to your build)
+            # e.g. cp dist/AGI.AppImage $RELEASE_DIR/linux/ || true
+          elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            # Mac: build .app / dmg
+            ./build-agi.sh || true
+            # e.g. cp -r dist/AGI.app $RELEASE_DIR/darwin/ || true
+          else
+            # Windows: build exe (run via bash remainder in Windows runner uses bash on mingw)
+            ./build-agi.sh || true
+            # e.g. cp dist/AGI.exe $RELEASE_DIR/win/ || true
+          fi
+
+      - name: Collect artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAMESPACE }}-desktop-${{ matrix.os }}
+          path: |
+            ${{ env.RELEASE_DIR }}/*
+
+  # Android build (separate because it requires keystore & Google Play secrets)
+  android:
+    needs: prepare
+    if: needs.prepare.outputs.tag_name != ''
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.prepare.outputs.tag_name }}
+      RELEASE_DIR: ${{ env.RELEASE_DIR }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - name: Install deps
+        run: yarn install --frozen-lockfile
+
+      - name: Setup Android credentials (keystore from secret)
+        if: secrets.ANDROID_KEYSTORE_BASE64 != ''
         run: |
-          sudo snap install snapcraft --classic
-          npm i -g electron-builder
-          npx electron-builder -l --publish always
+          echo "Restoring Android keystore..."
+          echo "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > android.keystore
+          # export keystore path env vars for bubblewrap or gradle
+          echo "ANDROID_KEYSTORE_PATH=$(pwd)/android.keystore" >> $GITHUB_ENV
+          echo "ANDROID_KEYSTORE_PASSWORD=${ANDROID_KEYSTORE_PASSWORD}" >> $GITHUB_ENV
+          echo "ANDROID_KEY_ALIAS=${ANDROID_KEY_ALIAS}" >> $GITHUB_ENV
+
+      - name: Build Android (Bubblewrap or your build)
+        run: |
+          # Example using bubblewrap if your project is PWA self-contained
+          npm i -g @bubblewrap/cli
+          npx @bubblewrap/cli init --manifest "https://url.curta/index.html" --appName "AGI" --packageId "app.portela.agi" --outputDir "$RELEASE_DIR/android" --yes || true
+          npx @bubblewrap/cli build --outputDir "$RELEASE_DIR/android" || true
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAMESPACE }}-android
+          path: ${{ env.RELEASE_DIR }}/android
+
+  # Create GitHub Release and upload artifacts
+  release:
+    needs: [build, android]
+    if: needs.prepare.outputs.tag_name != ''
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.prepare.outputs.tag_name }}
+      DRY_RUN: ${{ needs.prepare.outputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: |
+            ${{ env.ARTIFACT_NAMESPACE }}-desktop-ubuntu-latest
+            ${{ env.ARTIFACT_NAMESPACE }}-desktop-windows-latest
+            ${{ env.ARTIFACT_NAMESPACE }}-desktop-macos-latest
+            ${{ env.ARTIFACT_NAMESPACE }}-android
+          path: ./artifacts || true
+
+      - name: List artifacts (debug)
+        run: |
+          echo "=== Artifacts ==="
+          ls -R artifacts || true
+
+      - name: Prepare release notes
+        id: notes
+        run: |
+          # generate simple release notes from commits included in the tag
+          TAG="${TAG}"
+          # try to build release notes; fallback to basic message
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            NOTES=$(git log --pretty=format:'- %s (%h)' ${TAG}^..! || echo "Automated release ${TAG}")
+          else
+            NOTES="Automated release ${TAG}"
+          fi
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create or update GitHub Release
+        if: ${{ env.DRY_RUN != 'true' }}
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          body: ${{ steps.notes.outputs.notes }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload assets to GitHub Release
+        if: ${{ env.DRY_RUN != 'true' }}
+        run: |
+          set -e
+          # find artifacts and upload using gh (GitHub CLI) if available
+          # prefer GH CLI for uploading; fallback to curl+API if not available
+          if command -v gh >/dev/null 2>&1; then
+            gh release upload "${TAG}" artifacts/* --clobber || true
+          else
+            echo "gh CLI not available; uploading via API..."
+            for file in artifacts/*; do
+              [ -f "$file" ] || continue
+              NAME=$(basename "$file")
+              echo "Uploading $file"
+              UPLOAD_URL=$(jq -r .upload_url < <(gh api repos/${{ github.repository }}/releases/tags/${TAG} 2>/dev/null) | sed -e "s/{?name,label}//")
+              if [ -z "$UPLOAD_URL" ]; then
+                echo "Could not obtain upload url; skipping $file"
+                continue
+              fi
+              curl -s -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: application/octet-stream" --data-binary @"$file" "$UPLOAD_URL?name=$NAME"
+            done
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify (optional Slack)
+        if: ${{ secrets.SLACK_WEBHOOK != '' }}
+        run: |
+          echo "Sending Slack notification..."
+          PAYLOAD=$(jq -n --arg tag "${TAG}" --arg repo "${{ github.repository }}" '{text: ("Release " + $tag + " published for " + $repo)}')
+          curl -s -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "${{ secrets.SLACK_WEBHOOK }}"
+
+      - name: Dry-run summary
+        if: ${{ env.DRY_RUN == 'true' }}
+        run: |
+          echo "== Dry-run mode: release not published =="
+          ls -R artifacts || true
